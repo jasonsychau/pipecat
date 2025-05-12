@@ -15,7 +15,7 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame
+from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame, CancelFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -34,6 +34,24 @@ logger.add(sys.stderr, level="DEBUG")
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 
+from datetime import datetime
+from time import sleep
+from threading import Thread, Lock
+import asyncio
+import json
+thread_lock = Lock()
+last_message_time = datetime.now()
+silence_prompt_count = 0
+call_started = False
+# metrics
+silence_timestamps = []
+call_start = datetime.now()
+call_end = datetime.now()
+
+# References:
+# - https://docs.pipecat.ai/server/services/transport/daily#param-send-message
+# - https://docs.pipecat.ai/server/pipeline/pipeline-task#basic-usage
+# - alternative idle timeout: https://docs.pipecat.ai/server/pipeline/pipeline-idle-detection
 
 async def main(
     room_url: str,
@@ -162,10 +180,68 @@ async def main(
         await transport.capture_participant_transcription(participant["id"])
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
+        global last_message_time
+        global silence_prompt_count
+        global call_started
+        with thread_lock:
+            last_message_time = datetime.now()
+            call_started = True
+            silence_prompt_count = 0
+        call_started = datetime.now()
+
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         logger.debug(f"Participant left: {participant}, reason: {reason}")
         await task.cancel()
+
+    @transport.event_handler("on_transcription_message")
+    async def on_transcription_message(transport, message):
+        global last_message_time
+        global silence_prompt_count
+        with thread_lock:
+            last_message_time = datetime.now()
+            silence_prompt_count = 0
+
+    @transport.event_handler("on_participant_joined")
+    async def on_participant_joined(transport, participant):
+        global last_message_time
+        global silence_prompt_count
+        with thread_lock:
+            last_message_time = datetime.now()
+            silence_prompt_count = 0
+
+    async def send_message(msg: str):
+        await task.queue_frame(TTSSpeakFrame(msg))
+    async def exit_call():
+        global call_end
+        await task.queue_frame(CancelFrame())
+        call_end = datetime.now()
+                        
+    def monitor_silence():
+        global last_message_time
+        global silence_prompt_count
+        global call_started
+        while True:
+            sleep(10)
+            with thread_lock:
+                if call_started and ((datetime.now() - last_message_time).total_seconds() > 10):
+                    silence_timestamps.append(datetime.now())
+                    silence_prompt_count += 1
+                    last_message_time = datetime.now()
+                    # send TTS prompt for silence time
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    if silence_prompt_count>=3:
+                        loop.run_until_complete(send_message("Exiting call since silence was noted three times"))
+                        sleep(5)
+                        loop.run_until_complete(exit_call())
+                        loop.close()
+                        break
+                    else:
+                        loop.run_until_complete(send_message("Silence detected, will end call if idle"))
+                        loop.close()
+    thread = Thread(target = monitor_silence)
+    thread.start()
 
     # ------------ RUN PIPELINE ------------
 
@@ -174,6 +250,11 @@ async def main(
 
     runner = PipelineRunner()
     await runner.run(task)
+    logger.debug(f"Call metrics: {json.dumps({
+        "call_start": call_started.strftime("%Y-%m-%d %H:%M:%S"),
+        "silence_events": [dt.strftime("%Y-%m-%d %H:%M:%S") for dt in silence_timestamps],
+        "call_duration_seconds": (call_end-call_start).total_seconds()
+    })}")
 
 
 if __name__ == "__main__":
